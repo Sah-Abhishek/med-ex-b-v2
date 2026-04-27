@@ -1,0 +1,3 @@
+node_modules/
+.env
+WEBSOCKET_FRONTEND_GUIDE.md
