@@ -20,6 +20,12 @@ router.get('/analytics/team-lead', chartController.getTeamLeadAnalytics.bind(cha
 // Filter options
 router.get('/filters/facilities', chartController.getFacilities.bind(chartController));
 router.get('/filters/specialties', chartController.getSpecialties.bind(chartController));
+router.get('/filters/clients', chartController.getClients.bind(chartController));
+
+// Backfill / sync the client column from upstream chart listings (Valerion).
+// Frontend dashboards call this whenever they fetch a page of charts so the
+// (session_id → client) mapping accumulates over time.
+router.post('/sync-clients', chartController.syncClients.bind(chartController));
 
 // ═══════════════════════════════════════════════════════════════
 // DEBUG ENDPOINT - get raw data from database with code analysis

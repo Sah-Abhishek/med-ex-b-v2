@@ -48,6 +48,8 @@ async function startServer() {
 
     // Idempotent migrations for additive schema changes
     await pool.query(`ALTER TABLE charts ADD COLUMN IF NOT EXISTS encounter_payload JSONB`);
+    await pool.query(`ALTER TABLE charts ADD COLUMN IF NOT EXISTS client VARCHAR(255)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_charts_client ON charts(client)`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS reason_options (
         id SERIAL PRIMARY KEY,

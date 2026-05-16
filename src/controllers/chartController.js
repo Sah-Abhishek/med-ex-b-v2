@@ -664,9 +664,27 @@ class ChartController {
       const { period = '30' } = req.query;
       const periodDays = parseInt(period);
 
-      // Get overall stats
-      const overallStats = await query(`
-        SELECT 
+      // Optional specialty + client filters applied to every chart-scoped
+      // query below. A single helper builds the SQL fragment + the params.
+      const specialtyRaw = typeof req.query.specialty === 'string' ? req.query.specialty.trim() : '';
+      const specialtyFilter = specialtyRaw && specialtyRaw.toLowerCase() !== 'all' ? specialtyRaw : null;
+      const clientRaw = typeof req.query.client === 'string' ? req.query.client.trim() : '';
+      const clientFilter = clientRaw && clientRaw.toLowerCase() !== 'all' ? clientRaw : null;
+      const buildFiltersClause = (startIndex = 1) => {
+        const parts = [];
+        const params = [];
+        let idx = startIndex;
+        if (specialtyFilter) { parts.push(`AND specialty = $${idx++}`); params.push(specialtyFilter); }
+        if (clientFilter)    { parts.push(`AND client = $${idx++}`);    params.push(clientFilter); }
+        return { clause: parts.length ? ' ' + parts.join(' ') : '', params };
+      };
+      const baseFilters = buildFiltersClause(1);
+
+      // Get overall stats. When a specialty filter is set, it constrains every
+      // counter — including the "in period" counter — to that specialty.
+      const overallStats = await query(
+        `
+        SELECT
           COUNT(*) as total_charts,
           COUNT(*) FILTER (WHERE review_status = 'submitted') as submitted_charts,
           COUNT(*) FILTER (WHERE review_status = 'pending') as pending_charts,
@@ -677,11 +695,16 @@ class ChartController {
           COUNT(*) FILTER (WHERE ai_status = 'retry_pending') as retry_pending_charts,
           COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '${periodDays} days') as charts_in_period
         FROM charts
-      `);
+        WHERE 1=1
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       // Get submitted charts with original codes and modifications for CODE-LEVEL accuracy
-      const submittedChartsData = await query(`
-        SELECT 
+      const submittedChartsData = await query(
+        `
+        SELECT
           original_ai_codes,
           user_modifications,
           final_codes,
@@ -690,10 +713,13 @@ class ChartController {
           submitted_at,
           processing_started_at,
           processing_completed_at
-        FROM charts 
+        FROM charts
         WHERE review_status = 'submitted'
         AND submitted_at >= NOW() - INTERVAL '${periodDays} days'
-      `);
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       // Calculate AI accuracy at code level.
       // original_ai_codes is a category-keyed object ({ primary_diagnosis: [], procedures: [], ... });
@@ -792,32 +818,41 @@ class ChartController {
       });
 
       // Volume by facility
-      const volumeByFacility = await query(`
-        SELECT 
+      const volumeByFacility = await query(
+        `
+        SELECT
           facility,
           COUNT(*) as chart_count
         FROM charts
         WHERE created_at >= NOW() - INTERVAL '${periodDays} days'
         AND facility IS NOT NULL AND facility != ''
+        ${baseFilters.clause}
         GROUP BY facility
         ORDER BY chart_count DESC
         LIMIT 10
-      `);
+        `,
+        baseFilters.params
+      );
 
       // Get processing times
-      const processingTimes = await query(`
-        SELECT 
+      const processingTimes = await query(
+        `
+        SELECT
           AVG(EXTRACT(EPOCH FROM (processing_completed_at - processing_started_at))/60) as avg_processing_min,
           AVG(EXTRACT(EPOCH FROM (submitted_at - processing_completed_at))/60) as avg_review_min
         FROM charts
         WHERE review_status = 'submitted'
         AND processing_completed_at IS NOT NULL
         AND submitted_at >= NOW() - INTERVAL '${periodDays} days'
-      `);
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       // Get SLA compliance
-      const slaCompliance = await query(`
-        SELECT 
+      const slaCompliance = await query(
+        `
+        SELECT
           COUNT(*) as total,
           COUNT(*) FILTER (
             WHERE EXTRACT(EPOCH FROM (submitted_at - processing_completed_at))/3600 <= 24
@@ -826,15 +861,22 @@ class ChartController {
         WHERE review_status = 'submitted'
         AND processing_completed_at IS NOT NULL
         AND submitted_at >= NOW() - INTERVAL '${periodDays} days'
-      `);
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       // Get charts per day average
-      const chartsPerDay = await query(`
-        SELECT 
+      const chartsPerDay = await query(
+        `
+        SELECT
           COUNT(*)::float / NULLIF(${periodDays}, 0) as avg_per_day
         FROM charts
         WHERE created_at >= NOW() - INTERVAL '${periodDays} days'
-      `);
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       // Specialty accuracy — same shape handling as the main loop above.
       const specialtyData = {};
@@ -1051,6 +1093,92 @@ class ChartController {
   }
 
   /**
+   * Get distinct clients
+   * GET /api/charts/filters/clients
+   */
+  async getClients(req, res) {
+    try {
+      const { query } = await import('../db/connection.js');
+      const result = await query(
+        `SELECT DISTINCT client FROM charts WHERE client IS NOT NULL AND client != '' ORDER BY client`
+      );
+
+      res.json({
+        success: true,
+        clients: result.rows.map(r => r.client)
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  /**
+   * Backfill the `client` column from Valerion's chart listing.
+   * POST /api/charts/sync-clients
+   * Body: { mappings: [{ sessionId, client }, ...] }
+   *
+   * Charts in our DB are keyed by session_id (== Valerion chart Id). The
+   * frontend dashboards pass us the (session_id, client) pairs they got from
+   * Valerion so we can populate the column without a separate batch job.
+   * Unknown session_ids are silently ignored — they may belong to a chart we
+   * never ingested.
+   */
+  async syncClients(req, res) {
+    try {
+      const { query } = await import('../db/connection.js');
+      const mappings = Array.isArray(req.body?.mappings) ? req.body.mappings : [];
+
+      // Filter and normalize: keep only well-formed entries with non-empty client.
+      const valid = [];
+      for (const m of mappings) {
+        if (!m) continue;
+        const sessionId = m.sessionId != null ? String(m.sessionId) : null;
+        const client = typeof m.client === 'string' ? m.client.trim() : null;
+        if (!sessionId || !client) continue;
+        valid.push({ sessionId, client });
+      }
+
+      if (valid.length === 0) {
+        return res.json({ success: true, updated: 0, received: mappings.length });
+      }
+
+      // Build a single UPDATE ... FROM (VALUES ...) so we touch each row at most
+      // once, regardless of input size. Only overwrite when the value is empty
+      // or actually different — keeps updated_at meaningful.
+      const placeholders = [];
+      const params = [];
+      valid.forEach((m, i) => {
+        const a = i * 2 + 1;
+        const b = i * 2 + 2;
+        placeholders.push(`($${a}, $${b})`);
+        params.push(m.sessionId, m.client);
+      });
+
+      const result = await query(
+        `
+        UPDATE charts c
+        SET client = v.client,
+            updated_at = CURRENT_TIMESTAMP
+        FROM (VALUES ${placeholders.join(', ')}) AS v(session_id, client)
+        WHERE c.session_id = v.session_id
+          AND (c.client IS NULL OR c.client = '' OR c.client <> v.client)
+        `,
+        params
+      );
+
+      res.json({
+        success: true,
+        received: mappings.length,
+        considered: valid.length,
+        updated: result.rowCount || 0
+      });
+    } catch (error) {
+      console.error('Error syncing clients:', error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  /**
    * Delete chart
    * DELETE /api/charts/:chartNumber
    */
@@ -1122,14 +1250,34 @@ class ChartController {
       const { period = '30' } = req.query;
       const periodDays = parseInt(period, 10) || 30;
 
+      // Optional specialty / client filters. Empty/missing means "all".
+      const specialtyRaw = typeof req.query.specialty === 'string' ? req.query.specialty.trim() : '';
+      const specialtyFilter = specialtyRaw && specialtyRaw.toLowerCase() !== 'all' ? specialtyRaw : null;
+      const clientRaw = typeof req.query.client === 'string' ? req.query.client.trim() : '';
+      const clientFilter = clientRaw && clientRaw.toLowerCase() !== 'all' ? clientRaw : null;
+
       // Pagination params — only affect the per-chart details table, never the
-      // aggregate numbers. Clamp pageSize so a client can't ask for a huge page.
+      // aggregate numbers. Clamp pageSize so a request can't ask for a huge page.
       const requestedPage = parseInt(req.query.page, 10);
       const requestedPageSize = parseInt(req.query.pageSize, 10);
       const page = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
       const pageSize = Number.isFinite(requestedPageSize) && requestedPageSize > 0
         ? Math.min(requestedPageSize, 100)
         : 20;
+
+      // Build a parameterized filter predicate (specialty + client) that we
+      // append to every chart-scoped query. Returns the SQL fragment, the
+      // params, and the next free placeholder index for the caller's own
+      // params (e.g. LIMIT/OFFSET).
+      const buildFiltersClause = (startIndex = 1) => {
+        const parts = [];
+        const params = [];
+        let idx = startIndex;
+        if (specialtyFilter) { parts.push(`AND specialty = $${idx++}`); params.push(specialtyFilter); }
+        if (clientFilter)    { parts.push(`AND client = $${idx++}`);    params.push(clientFilter); }
+        return { clause: parts.length ? ' ' + parts.join(' ') : '', params, nextIndex: idx };
+      };
+      const baseFilters = buildFiltersClause(1);
 
       // A timing row is "valid" (contributes to averages, SLA distribution, and
       // the paginated list) iff sla_data.durations_ms exists. We reuse this
@@ -1141,7 +1289,8 @@ class ChartController {
       `;
 
       // Overall processing stats
-      const overallStats = await dbQuery(`
+      const overallStats = await dbQuery(
+        `
         SELECT
           COUNT(*) as total_charts,
           COUNT(*) FILTER (WHERE ai_status = 'ready' OR review_status = 'submitted') as completed,
@@ -1151,11 +1300,15 @@ class ChartController {
           COUNT(*) FILTER (WHERE ai_status = 'retry_pending') as retry_pending
         FROM charts
         WHERE created_at >= NOW() - INTERVAL '${periodDays} days'
-      `);
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       // Aggregate timing + SLA distribution over the full set in SQL so we
       // don't stream every row back to Node just to count them.
-      const timingAgg = await dbQuery(`
+      const timingAgg = await dbQuery(
+        `
         SELECT
           COUNT(*)::int AS total,
           AVG((sla_data->'durations_ms'->>'ocr')::bigint)   AS avg_ocr,
@@ -1167,7 +1320,10 @@ class ChartController {
           COUNT(*) FILTER (WHERE sla_data->'slaStatus'->>'status' = 'delayed' OR sla_data->'slaStatus'->>'status' IS NULL) AS sla_delayed
         FROM charts
         WHERE ${validTimingWhere}
-      `);
+        ${baseFilters.clause}
+        `,
+        baseFilters.params
+      );
 
       const aggRow = timingAgg.rows[0] || {};
       const totalTimings = parseInt(aggRow.total || 0, 10);
@@ -1191,15 +1347,22 @@ class ChartController {
       };
 
       // Fetch only the current page's rows for the per-chart table.
-      const pageRows = await dbQuery(`
+      const pageFilters = buildFiltersClause(1);
+      const pageRowsLimitIdx = pageFilters.nextIndex;
+      const pageRowsOffsetIdx = pageFilters.nextIndex + 1;
+      const pageRows = await dbQuery(
+        `
         SELECT
-          id, chart_number, session_id, facility, specialty, ai_status,
+          id, chart_number, session_id, facility, specialty, client, ai_status,
           document_count, sla_data, created_at
         FROM charts
         WHERE ${validTimingWhere}
+        ${pageFilters.clause}
         ORDER BY created_at DESC
-        LIMIT $1 OFFSET $2
-      `, [pageSize, offset]);
+        LIMIT $${pageRowsLimitIdx} OFFSET $${pageRowsOffsetIdx}
+        `,
+        [...pageFilters.params, pageSize, offset]
+      );
 
       const chartTimings = pageRows.rows.map(row => {
         const sla = row.sla_data || {};
@@ -1210,6 +1373,7 @@ class ChartController {
           sessionId: row.session_id,
           facility: row.facility,
           specialty: row.specialty,
+          client: row.client,
           documentCount: row.document_count,
           ocrMs: d.ocr,
           aiMs: d.ai,
@@ -1220,21 +1384,48 @@ class ChartController {
         };
       });
 
-      // Queue stats
-      const queueStats = await dbQuery(`
-        SELECT
-          COUNT(*) as total_jobs,
-          COUNT(*) FILTER (WHERE status = 'pending') as pending,
-          COUNT(*) FILTER (WHERE status = 'processing') as processing,
-          COUNT(*) FILTER (WHERE status = 'completed') as completed,
-          COUNT(*) FILTER (WHERE status = 'permanently_failed') as failed,
-          AVG(attempts) FILTER (WHERE status = 'completed') as avg_attempts
-        FROM processing_queue
-        WHERE created_at >= NOW() - INTERVAL '${periodDays} days'
-      `);
+      // Queue stats. When any chart-side filter is active we join to charts
+      // so the queue numbers reflect only jobs belonging to those charts.
+      const anyChartFilter = specialtyFilter || clientFilter;
+      const queueStats = anyChartFilter
+        ? await (async () => {
+            const joinFilters = [];
+            const joinParams = [];
+            let idx = 1;
+            if (specialtyFilter) { joinFilters.push(`AND c.specialty = $${idx++}`); joinParams.push(specialtyFilter); }
+            if (clientFilter)    { joinFilters.push(`AND c.client = $${idx++}`);    joinParams.push(clientFilter); }
+            return dbQuery(
+              `
+              SELECT
+                COUNT(*) as total_jobs,
+                COUNT(*) FILTER (WHERE pq.status = 'pending') as pending,
+                COUNT(*) FILTER (WHERE pq.status = 'processing') as processing,
+                COUNT(*) FILTER (WHERE pq.status = 'completed') as completed,
+                COUNT(*) FILTER (WHERE pq.status = 'permanently_failed') as failed,
+                AVG(pq.attempts) FILTER (WHERE pq.status = 'completed') as avg_attempts
+              FROM processing_queue pq
+              JOIN charts c ON c.id = pq.chart_id
+              WHERE pq.created_at >= NOW() - INTERVAL '${periodDays} days'
+              ${joinFilters.join(' ')}
+              `,
+              joinParams
+            );
+          })()
+        : await dbQuery(`
+            SELECT
+              COUNT(*) as total_jobs,
+              COUNT(*) FILTER (WHERE status = 'pending') as pending,
+              COUNT(*) FILTER (WHERE status = 'processing') as processing,
+              COUNT(*) FILTER (WHERE status = 'completed') as completed,
+              COUNT(*) FILTER (WHERE status = 'permanently_failed') as failed,
+              AVG(attempts) FILTER (WHERE status = 'completed') as avg_attempts
+            FROM processing_queue
+            WHERE created_at >= NOW() - INTERVAL '${periodDays} days'
+          `);
 
       // Daily volume
-      const dailyVolume = await dbQuery(`
+      const dailyVolume = await dbQuery(
+        `
         SELECT
           DATE(created_at) as date,
           COUNT(*) as total,
@@ -1242,10 +1433,13 @@ class ChartController {
           COUNT(*) FILTER (WHERE ai_status = 'failed') as failed
         FROM charts
         WHERE created_at >= NOW() - INTERVAL '${periodDays} days'
+        ${baseFilters.clause}
         GROUP BY DATE(created_at)
         ORDER BY date DESC
         LIMIT 30
-      `);
+        `,
+        baseFilters.params
+      );
 
       res.json({
         success: true,
@@ -1292,7 +1486,7 @@ class ChartController {
   async getTeamLeadAnalytics(req, res) {
     try {
       const { query } = await import('../db/connection.js');
-      const { startDate, endDate, facility, specialty, coderId } = req.query;
+      const { startDate, endDate, facility, specialty, client, coderId } = req.query;
 
       const where = [
         `review_status = 'submitted'`,
@@ -1306,11 +1500,12 @@ class ChartController {
       if (endDate)   where.push(`submitted_at <= ${addParam(endDate)}`);
       if (facility)  where.push(`facility = ${addParam(facility)}`);
       if (specialty) where.push(`specialty = ${addParam(specialty)}`);
+      if (client)    where.push(`client = ${addParam(client)}`);
       if (coderId)   where.push(`submitted_by = ${addParam(coderId)}`);
 
       const sql = `
-        SELECT id, chart_number, facility, specialty, submitted_at, submitted_by,
-               user_modifications
+        SELECT id, chart_number, facility, specialty, client, submitted_at,
+               submitted_by, user_modifications
         FROM charts
         WHERE ${where.join(' AND ')}
         ORDER BY submitted_at DESC
@@ -1394,6 +1589,7 @@ class ChartController {
           chartNumber: row.chart_number,
           facility: row.facility,
           specialty: row.specialty,
+          client: row.client,
           submittedBy: row.submitted_by,
           submittedAt: row.submitted_at,
           totalActions: perChartActions,
@@ -1422,6 +1618,7 @@ class ChartController {
           endDate: endDate || null,
           facility: facility || null,
           specialty: specialty || null,
+          client: client || null,
           coderId: coderId || null
         },
         summary,
